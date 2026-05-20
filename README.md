@@ -4,7 +4,7 @@ The following code and results pertain to an analysis of coordination between ha
 
 ### Dataset
 
-The Expressive Musical Gestures dataset was used for this project, which is reported in the following paper:
+The [Expressive Musical Gestures dataset](https://gitlab.doc.gold.ac.uk/expressive-musical-gestures/dataset/tree/master/piano) was used for this project, which is reported in the following paper:
 Álvaro Sarasúa, Baptiste Caramiaux, Atau Tanaka, and Miguel Ortiz (2017). Datasets for the Analysis of Expressive Musical Gestures. In Proceedings of the 4th International Conference on Movement Computing, London, UK, June 2017 (MOCO'17).
 
 
