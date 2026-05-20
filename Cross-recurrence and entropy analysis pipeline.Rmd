@@ -1,0 +1,1117 @@
+# Summary
+
+The following code was written as a part of the Complex Systems course at Tilburg University. The goal of the project is to analyse the complex coupling relationships between hands during piano play in different playing styles (namely 'normal', 'exaggerated' and 'still'). The 'expressive musical gestures' dataset reported in a paper by Sarasúa et al. was used to this end. The following code uses mdCRQA and transfer entropy to analyse the changing relationships between these playing styles. Grid search is used to optimize the parameters and surrogate testing is used to verify results are not due to chance.
+
+Álvaro Sarasúa, Baptiste Caramiaux, Atau Tanaka, and Miguel Ortiz (2017). Datasets for the Analysis of Expressive Musical Gestures. In Proceedings of the 4th International Conference on Movement Computing, London, UK, June 2017 (MOCO'17).
+
+
+# Setup
+```{r setup, include=FALSE}
+# R chunk
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+``` {r}
+# R chunk
+library(reticulate)
+```
+
+
+``` {r}
+# R chunk
+py_require("pandas")
+py_require("multiSyncPy")
+```
+
+``` {python}
+# Python chunk
+import pandas as pd
+import numpy as np
+from glob import glob
+import multiSyncPy as msp
+from multiSyncPy import synchrony_metrics as sm
+```
+
+# Settings
+``` {python}
+# Python chunk
+
+# You can replace any variable of the styles with * to include all variations
+STYLES_OF_INTEREST = ["NOMETRO_NORMAL_NORMAL", "NOMETRO_NORMAL_EXAG", "NOMETRO_NORMAL_STILL"]
+USE_VELOCITY = True # Set to 'False' to use raw coordinates
+NORMALIZE = True # Also clips extreme values
+LOWER_Q = 0.01 # Values below of these quantile bounds will be clipped to this quantile value
+UPPER_Q = 0.99 # Values above of these quantile bounds will be clipped to this quantile value
+PIANIST_NUM = "pianist01" # Selects which pianist is analysed. Must match folder name!
+
+# Grid search hyperparameter tuning for mdCRQA
+RR_RANGE = [1, 5] # Minimum, maximum values for RR for hyperparameters to be deemed appropriate.
+MUST_MATCH_ALL = False # Determines whether all recordings for the selected style must match the same hyperparameters or whether they can differ.
+
+DELAYS = [5,10,25] # Parameter value options for delay (d)
+EMBEDS = [2,3,4,5,6] # Parameter value options for embedding dimension (m)
+RADII = [0.1,0.2,0.3,0.4,0.5,0.65,0.8] # Parameter value options for radius (r)
+
+# History length for transfer entropy
+LXS = 5 # Number of past data points to consider for the history of the variable (max = 20)
+
+# Random seed
+SEED = 102026
+
+``` 
+
+# Load data
+``` {python}
+# Python chunk
+
+labels = []
+
+def load_data(styles = STYLES_OF_INTEREST, pianist=PIANIST_NUM):
+  global labels
+  data = []
+
+  for style in STYLES_OF_INTEREST:
+    file_names = glob(f"data/{pianist}/{style}_*_mocap.csv")
+    labels += [file_name.split("/")[-1][:-10] for file_name in file_names]
+    print(f"There are {len(file_names)} files for {style}.")
+    for file_name in file_names:
+      data.append(pd.read_csv(file_name, delimiter=";"))
+      
+  return [*data]
+```
+
+# Pre-processing
+``` {python}
+# Python chunk
+
+def filter_data(data, q=USE_VELOCITY):
+  df_raw = pd.DataFrame(data)
+  df_clean = pd.DataFrame()
+
+  # Select relevant columns
+  if q: # calculate gradient if use_velocity is selected
+    df_raw["LHAND_x"] = np.gradient(df_raw["LHAND_x"])
+    df_raw["LHAND_y"] = np.gradient(df_raw["LHAND_y"])
+    df_raw["LHAND_z"] = np.gradient(df_raw["LHAND_z"])
+    
+    df_raw["RHAND_x"] = np.gradient(df_raw["RHAND_x"])
+    df_raw["RHAND_y"] = np.gradient(df_raw["RHAND_y"])
+    df_raw["RHAND_z"] = np.gradient(df_raw["RHAND_z"])
+    df_clean["LHAND_q"] = df_raw[["LHAND_x", "LHAND_y", "LHAND_z"]].values.tolist()
+    df_clean["RHAND_q"] = df_raw[["RHAND_x", "RHAND_y", "RHAND_z"]].values.tolist()
+  else: # else use 'raw' coordinates
+    df_clean["LHAND"] = df_raw[["LHAND_x", "LHAND_y", "LHAND_z"]].values.tolist()
+    df_clean["RHAND"] = df_raw[["RHAND_x", "RHAND_y", "RHAND_z"]].values.tolist()
+    
+  return df_clean
+
+loaded_data = load_data()
+filtered_data = [filter_data(l_data) for l_data in loaded_data]
+print(labels)
+```
+There are 3 files for NOMETRO_NORMAL_NORMAL.
+There are 3 files for NOMETRO_NORMAL_EXAG.
+There are 3 files for NOMETRO_NORMAL_STILL.
+['NOMETRO_NORMAL_NORMAL_2', 'NOMETRO_NORMAL_NORMAL_1', 'NOMETRO_NORMAL_NORMAL_3', 'NOMETRO_NORMAL_EXAG_3', 'NOMETRO_NORMAL_EXAG_1', 'NOMETRO_NORMAL_EXAG_2', 'NOMETRO_NORMAL_STILL_3', 'NOMETRO_NORMAL_STILL_2', 'NOMETRO_NORMAL_STILL_1']
+
+# Normalization
+``` {r}
+# R chunk
+
+# define normalization function
+min_max_norm <- function(x) {
+    (x - min(x)) / (max(x) - min(x))
+}
+
+# This function handles min-max normalization as well as quantile capping as described in settings. If 'NORMALIZE' is set to false, this function is never ran and the original data is used.
+normalize_data <- function(LHAND, RHAND) {
+  LHAND <- as.data.frame(LHAND)
+  RHAND <- as.data.frame(RHAND)
+  
+  # Quantile capping
+  RHAND$x[RHAND$x < quantile(RHAND$x, py$LOWER_Q)] <- quantile(RHAND$x, py$LOWER_Q)
+  RHAND$y[RHAND$y < quantile(RHAND$y, py$LOWER_Q)] <- quantile(RHAND$y, py$LOWER_Q)
+  RHAND$z[RHAND$z < quantile(RHAND$z, py$LOWER_Q)] <- quantile(RHAND$z, py$LOWER_Q)
+  RHAND$x[RHAND$x > quantile(RHAND$x, py$UPPER_Q)] <- quantile(RHAND$x, py$UPPER_Q)
+  RHAND$y[RHAND$y > quantile(RHAND$y, py$UPPER_Q)] <- quantile(RHAND$y, py$UPPER_Q)
+  RHAND$z[RHAND$z > quantile(RHAND$z, py$UPPER_Q)] <- quantile(RHAND$z, py$UPPER_Q)
+  
+  LHAND$x[LHAND$x < quantile(LHAND$x, py$LOWER_Q)] <- quantile(LHAND$x, py$LOWER_Q)
+  LHAND$y[LHAND$y < quantile(LHAND$y, py$LOWER_Q)] <- quantile(LHAND$y, py$LOWER_Q)
+  LHAND$z[LHAND$z < quantile(LHAND$z, py$LOWER_Q)] <- quantile(LHAND$z, py$LOWER_Q)
+  LHAND$x[LHAND$x > quantile(LHAND$x, py$UPPER_Q)] <- quantile(LHAND$x, py$UPPER_Q)
+  LHAND$y[LHAND$y > quantile(LHAND$y, py$UPPER_Q)] <- quantile(LHAND$y, py$UPPER_Q)
+  LHAND$z[LHAND$z > quantile(LHAND$z, py$UPPER_Q)] <- quantile(LHAND$z, py$UPPER_Q)
+  
+  # Min-max normalization
+  both_hands <- c(as.data.frame(LHAND), as.data.frame(RHAND))
+  both_hands_norm <- as.data.frame(lapply(both_hands, min_max_norm))
+  
+  # Fixing variable names
+  LHAND_new <- both_hands_norm[c('x', 'y', 'z')]
+  colnames(LHAND_new) <- c("x","y","z")
+  RHAND_new <- both_hands_norm[c('x.1', 'y.1', 'z.1')]
+  colnames(RHAND_new) <- c("x","y","z")
+    
+  return(list(LHAND_new, RHAND_new))
+}
+
+normalized_data <- list()
+
+for (data in py$filtered_data) {
+  LHAND <- t(as.data.frame(data$LHAND))
+  rownames(LHAND) <- NULL # To reset row names 
+  colnames(LHAND) <- c("x","y","z")
+
+  RHAND <- t(as.data.frame(data$RHAND))
+  rownames(RHAND) <- NULL
+  colnames(RHAND) <- c("x","y","z")
+  
+  if (py$NORMALIZE) {
+    norm_data <- normalize_data(LHAND, RHAND)
+    LHAND <- norm_data[1]
+    RHAND <- norm_data[2]
+  }
+  
+  LHAND <- as.data.frame(LHAND)
+  RHAND <- as.data.frame(RHAND)
+  
+  normalized_data[[length(normalized_data)+1]] <- list(LHAND, RHAND)
+}
+
+# normalized_data is now a list of lists, each containing the left and right hand of a selected playstyle recording.
+# To split them up into the desired playstyle groups again, you can verify the number of recordings each style
+# has in the printed text under the 'Preprocessing' code block.
+```
+
+
+# Exploratory plot of data
+``` {r}
+# R chunk
+library(plot3D)
+
+scatter3D(LHAND$x, LHAND$y, LHAND$z)
+scatter3D(RHAND$x, RHAND$y, RHAND$z)
+```
+
+# Optimize parameters
+``` {r}
+# R chunk
+library(crqa)
+library(pracma)
+
+print(sprintf("Compatible parameters per style for %s<RR<%s based on parameter grid",py$RR_RANGE[[1]], py$RR_RANGE[[2]]))
+print("")
+
+# Provides parameters that fit the RR bounds in Settings given a parameter grid for delays, embedding dimensions and radii
+optimizeParam_mdCRQA <- function (rec_LHAND, rec_RHAND, rec_delay, rec_embed, rec_radius) {
+  param_options <- list()
+  for (delay in rec_delay) {
+    for (embed_dim in rec_embed) {
+      for (radius in rec_radius) {
+        result <- crqa(ts1=rec_LHAND, ts2=rec_RHAND, delay=delay, embed=embed_dim, radius=radius, method="mdcrqa", normalize=2)
+        # Uncomment the line below to print all outputs, even if they fall outside of the preset bounds for RR
+        #print(sprintf("d=%s;e=%s;r=%s -> RR=%s;DET=%s", delay, embed_dim, radius, round(result$RR, 3), round(result$DET, 3)))
+        
+        # Stores parameter combinations that fit RR range
+        if (result$RR > py$RR_RANGE[[1]] && result$RR < py$RR_RANGE[[2]]) {
+          param_options[[length(param_options)+1]] <- sprintf("d=%s;e=%s;r=%s", delay, embed_dim, radius)
+          
+          # Print intermediate results that match RR range.
+          if (!py$MUST_MATCH_ALL) {
+            print(sprintf("d=%s;e=%s;r=%s -> RR=%s;DET=%s", delay, embed_dim, radius, round(result$RR, 3), round(result$DET, 3)))
+          }
+        }
+      }
+    }
+  }
+  return(param_options)
+}
+
+# Simple function to help print parameter options that fit all recordings in a style
+print_params <- function (style, param_options_list) {
+    print(paste("Matches all recordings for",style))
+    print(str(Reduce(intersect, param_options_list)))
+    param_options_list <- list()
+}
+
+prev_style <- ""
+param_options_list <- list()
+for (i in 1:length(normalized_data)) {
+  rec_label <- array(py$labels)[i] # e.g. NOMETRO_NORMAL_NORMAL_1
+  rec_style <- substr(rec_label, 1, nchar(rec_label)-2) # e.g. NOMETRO_NORMAL_NORMAL
+  rec_data <- normalized_data[i]
+  
+  # Print the parameters that work for all recordings in a specific style
+  if (prev_style != rec_style && prev_style != "") {
+    print_params(prev_style, param_options_list)
+    param_options_list <- list()
+  }
+  if (!py$MUST_MATCH_ALL) {
+    print(rec_label)
+  }
+  
+  
+  param_options <- optimizeParam_mdCRQA(rec_LHAND=rec_data[[1]][[1]], rec_RHAND=rec_data[[1]][[2]], rec_delay=py$DELAYS, rec_embed=py$EMBEDS, rec_radius=py$RADII)
+  param_options_list[[length(param_options_list)+1]] <- param_options
+
+  prev_style <- rec_style
+}
+print_params(prev_style)
+
+```
+
+[1] "Compatible parameters per style for 1<RR<5 based on parameter grid"
+[1] ""
+[1] "NOMETRO_NORMAL_NORMAL_2"
+[1] "d=5;e=2;r=0.4 -> RR=2.115;DET=70.767"
+[1] "d=5;e=2;r=0.5 -> RR=3.511;DET=74.941"
+[1] "d=5;e=3;r=0.5 -> RR=1.621;DET=74.035"
+[1] "d=5;e=3;r=0.65 -> RR=2.972;DET=79.381"
+[1] "d=5;e=3;r=0.8 -> RR=4.701;DET=81.609"
+[1] "d=5;e=4;r=0.65 -> RR=1.729;DET=77.933"
+[1] "d=5;e=4;r=0.8 -> RR=2.789;DET=81.381"
+[1] "d=5;e=5;r=0.65 -> RR=1.075;DET=76.934"
+[1] "d=5;e=5;r=0.8 -> RR=1.811;DET=80.364"
+[1] "d=5;e=6;r=0.8 -> RR=1.22;DET=79.895"
+[1] "d=10;e=2;r=0.4 -> RR=1.875;DET=68.078"
+[1] "d=10;e=2;r=0.5 -> RR=3.105;DET=73.265"
+[1] "d=10;e=3;r=0.5 -> RR=1.307;DET=73.753"
+[1] "d=10;e=3;r=0.65 -> RR=2.403;DET=77.935"
+[1] "d=10;e=3;r=0.8 -> RR=3.819;DET=80.327"
+[1] "d=10;e=4;r=0.65 -> RR=1.276;DET=78.155"
+[1] "d=10;e=4;r=0.8 -> RR=2.085;DET=79.02"
+[1] "d=10;e=5;r=0.8 -> RR=1.257;DET=80.455"
+[1] "d=25;e=2;r=0.4 -> RR=1.461;DET=69.43"
+[1] "d=25;e=2;r=0.5 -> RR=2.423;DET=74.093"
+[1] "d=25;e=2;r=0.65 -> RR=4.235;DET=77.556"
+[1] "d=25;e=3;r=0.65 -> RR=1.666;DET=78.708"
+[1] "d=25;e=3;r=0.8 -> RR=2.606;DET=80.71"
+[1] "d=25;e=4;r=0.8 -> RR=1.281;DET=79.403"
+[1] "NOMETRO_NORMAL_NORMAL_1"
+[1] "d=5;e=2;r=0.4 -> RR=1.689;DET=61.77"
+[1] "d=5;e=2;r=0.5 -> RR=3.025;DET=67.716"
+[1] "d=5;e=3;r=0.5 -> RR=1.153;DET=66.194"
+[1] "d=5;e=3;r=0.65 -> RR=2.39;DET=69.217"
+[1] "d=5;e=3;r=0.8 -> RR=4.206;DET=73.792"
+[1] "d=5;e=4;r=0.65 -> RR=1.219;DET=70.628"
+[1] "d=5;e=4;r=0.8 -> RR=2.158;DET=70.373"
+[1] "d=5;e=5;r=0.8 -> RR=1.276;DET=71.968"
+[1] "d=10;e=2;r=0.4 -> RR=1.5;DET=62.255"
+[1] "d=10;e=2;r=0.5 -> RR=2.678;DET=68.056"
+[1] "d=10;e=3;r=0.65 -> RR=1.957;DET=70.555"
+[1] "d=10;e=3;r=0.8 -> RR=3.461;DET=73.519"
+[1] "d=10;e=4;r=0.8 -> RR=1.666;DET=71.505"
+[1] "d=25;e=2;r=0.4 -> RR=1.239;DET=61.032"
+[1] "d=25;e=2;r=0.5 -> RR=2.208;DET=66.509"
+[1] "d=25;e=2;r=0.65 -> RR=4.254;DET=72.628"
+[1] "d=25;e=3;r=0.65 -> RR=1.513;DET=71.456"
+[1] "d=25;e=3;r=0.8 -> RR=2.585;DET=75.235"
+[1] "d=25;e=4;r=0.8 -> RR=1.134;DET=71.688"
+[1] "NOMETRO_NORMAL_NORMAL_3"
+[1] "Matches all recordings for NOMETRO_NORMAL_NORMAL"
+ list()
+NULL
+[1] "NOMETRO_NORMAL_EXAG_3"
+[1] "d=5;e=2;r=0.4 -> RR=2.061;DET=65.503"
+[1] "d=5;e=2;r=0.5 -> RR=3.593;DET=69.181"
+[1] "d=5;e=3;r=0.5 -> RR=1.516;DET=71.859"
+[1] "d=5;e=3;r=0.65 -> RR=3.012;DET=72.619"
+[1] "d=5;e=4;r=0.65 -> RR=1.661;DET=75.508"
+[1] "d=5;e=4;r=0.8 -> RR=2.928;DET=76.654"
+[1] "d=5;e=5;r=0.65 -> RR=1.083;DET=79.769"
+[1] "d=5;e=5;r=0.8 -> RR=1.862;DET=78.596"
+[1] "d=5;e=6;r=0.8 -> RR=1.312;DET=81.359"
+[1] "d=10;e=2;r=0.4 -> RR=1.885;DET=65.714"
+[1] "d=10;e=2;r=0.5 -> RR=3.28;DET=68.83"
+[1] "d=10;e=3;r=0.5 -> RR=1.364;DET=72.625"
+[1] "d=10;e=3;r=0.65 -> RR=2.71;DET=74.693"
+[1] "d=10;e=3;r=0.8 -> RR=4.569;DET=76.857"
+[1] "d=10;e=4;r=0.65 -> RR=1.468;DET=78.081"
+[1] "d=10;e=4;r=0.8 -> RR=2.539;DET=78.126"
+[1] "d=10;e=5;r=0.8 -> RR=1.588;DET=80.783"
+[1] "d=10;e=6;r=0.8 -> RR=1.097;DET=83.216"
+[1] "d=25;e=2;r=0.4 -> RR=1.618;DET=67.01"
+[1] "d=25;e=2;r=0.5 -> RR=2.77;DET=70.358"
+[1] "d=25;e=3;r=0.5 -> RR=1.066;DET=72.582"
+[1] "d=25;e=3;r=0.65 -> RR=2.033;DET=76.094"
+[1] "d=25;e=3;r=0.8 -> RR=3.407;DET=79.398"
+[1] "d=25;e=4;r=0.65 -> RR=1.024;DET=77.849"
+[1] "d=25;e=4;r=0.8 -> RR=1.738;DET=79.506"
+[1] "NOMETRO_NORMAL_EXAG_1"
+[1] "d=5;e=2;r=0.3 -> RR=1.134;DET=62.176"
+[1] "d=5;e=2;r=0.4 -> RR=2.313;DET=67.22"
+[1] "d=5;e=2;r=0.5 -> RR=3.86;DET=71.929"
+[1] "d=5;e=3;r=0.5 -> RR=1.695;DET=71.172"
+[1] "d=5;e=3;r=0.65 -> RR=3.21;DET=74.868"
+[1] "d=5;e=4;r=0.65 -> RR=1.809;DET=73.207"
+[1] "d=5;e=4;r=0.8 -> RR=3;DET=76.022"
+[1] "d=5;e=5;r=0.65 -> RR=1.154;DET=77.179"
+[1] "d=5;e=5;r=0.8 -> RR=1.926;DET=74.998"
+[1] "d=5;e=6;r=0.8 -> RR=1.317;DET=77.474"
+[1] "d=10;e=2;r=0.3 -> RR=1.025;DET=62.786"
+[1] "d=10;e=2;r=0.4 -> RR=2.031;DET=67.551"
+[1] "d=10;e=2;r=0.5 -> RR=3.375;DET=71.031"
+[1] "d=10;e=3;r=0.5 -> RR=1.416;DET=71.054"
+[1] "d=10;e=3;r=0.65 -> RR=2.656;DET=74.353"
+[1] "d=10;e=3;r=0.8 -> RR=4.33;DET=78.197"
+[1] "d=10;e=4;r=0.65 -> RR=1.408;DET=73.561"
+[1] "d=10;e=4;r=0.8 -> RR=2.345;DET=76.094"
+[1] "d=10;e=5;r=0.8 -> RR=1.421;DET=77.002"
+[1] "d=25;e=2;r=0.4 -> RR=1.611;DET=67.674"
+[1] "d=25;e=2;r=0.5 -> RR=2.68;DET=72.431"
+[1] "d=25;e=2;r=0.65 -> RR=4.757;DET=77.088"
+[1] "d=25;e=3;r=0.65 -> RR=1.825;DET=77.933"
+[1] "d=25;e=3;r=0.8 -> RR=2.97;DET=78.395"
+[1] "d=25;e=4;r=0.8 -> RR=1.451;DET=78.888"
+[1] "NOMETRO_NORMAL_EXAG_2"
+[1] "d=5;e=2;r=0.4 -> RR=1.057;DET=47.952"
+[1] "d=5;e=2;r=0.5 -> RR=2.166;DET=56.415"
+[1] "d=5;e=2;r=0.65 -> RR=4.642;DET=67.646"
+[1] "d=5;e=3;r=0.65 -> RR=1.649;DET=60.818"
+[1] "d=5;e=3;r=0.8 -> RR=3.291;DET=68.403"
+[1] "d=5;e=4;r=0.8 -> RR=1.514;DET=65.04"
+[1] "d=10;e=2;r=0.5 -> RR=1.904;DET=56.857"
+[1] "d=10;e=2;r=0.65 -> RR=4.08;DET=67.641"
+[1] "d=10;e=3;r=0.65 -> RR=1.288;DET=58.489"
+[1] "d=10;e=3;r=0.8 -> RR=2.632;DET=66.586"
+[1] "d=10;e=4;r=0.8 -> RR=1.063;DET=60.366"
+Warning in max(t1) : no non-missing arguments to max; returning -Inf
+[1] "d=25;e=2;r=0.5 -> RR=1.417;DET=55.845"
+[1] "d=25;e=2;r=0.65 -> RR=3.133;DET=66.047"
+[1] "d=25;e=3;r=0.8 -> RR=1.67;DET=64.626"
+[1] "Matches all recordings for NOMETRO_NORMAL_EXAG"
+List of 10
+ $ : chr "d=5;e=2;r=0.4"
+ $ : chr "d=5;e=2;r=0.5"
+ $ : chr "d=5;e=3;r=0.65"
+ $ : chr "d=5;e=4;r=0.8"
+ $ : chr "d=10;e=2;r=0.5"
+ $ : chr "d=10;e=3;r=0.65"
+ $ : chr "d=10;e=3;r=0.8"
+ $ : chr "d=10;e=4;r=0.8"
+ $ : chr "d=25;e=2;r=0.5"
+ $ : chr "d=25;e=3;r=0.8"
+NULL
+[1] "NOMETRO_NORMAL_STILL_3"
+[1] "d=5;e=2;r=0.4 -> RR=1.208;DET=41.224"
+[1] "d=5;e=2;r=0.5 -> RR=2.492;DET=56.174"
+[1] "d=5;e=3;r=0.65 -> RR=1.931;DET=60.726"
+[1] "d=5;e=3;r=0.8 -> RR=3.598;DET=69.677"
+[1] "d=5;e=4;r=0.8 -> RR=1.726;DET=64.661"
+[1] "d=10;e=2;r=0.4 -> RR=1.086;DET=39.592"
+[1] "d=10;e=2;r=0.5 -> RR=2.252;DET=54.899"
+[1] "d=10;e=2;r=0.65 -> RR=4.592;DET=67.223"
+[1] "d=10;e=3;r=0.65 -> RR=1.57;DET=57.388"
+[1] "d=10;e=3;r=0.8 -> RR=2.975;DET=66.806"
+[1] "d=10;e=4;r=0.8 -> RR=1.256;DET=58.882"
+[1] "d=25;e=2;r=0.5 -> RR=1.807;DET=52.732"
+[1] "d=25;e=2;r=0.65 -> RR=3.792;DET=64.411"
+[1] "d=25;e=3;r=0.65 -> RR=1.004;DET=50.367"
+[1] "d=25;e=3;r=0.8 -> RR=2.068;DET=61.339"
+[1] "NOMETRO_NORMAL_STILL_2"
+[1] "d=5;e=2;r=0.5 -> RR=1.829;DET=54.843"
+[1] "d=5;e=2;r=0.65 -> RR=3.793;DET=64.581"
+[1] "d=5;e=3;r=0.65 -> RR=1.359;DET=56.977"
+[1] "d=5;e=3;r=0.8 -> RR=2.584;DET=65.985"
+[1] "d=5;e=4;r=0.8 -> RR=1.173;DET=59.936"
+[1] "d=10;e=2;r=0.5 -> RR=1.671;DET=52.419"
+[1] "d=10;e=2;r=0.65 -> RR=3.502;DET=63.448"
+[1] "d=10;e=3;r=0.65 -> RR=1.128;DET=53.416"
+[1] "d=10;e=3;r=0.8 -> RR=2.21;DET=62.881"
+[1] "d=25;e=2;r=0.5 -> RR=1.277;DET=49.291"
+[1] "d=25;e=2;r=0.65 -> RR=2.764;DET=61.223"
+[1] "d=25;e=2;r=0.8 -> RR=4.904;DET=67.776"
+[1] "d=25;e=3;r=0.8 -> RR=1.28;DET=55.327"
+Warning in max(t1) : no non-missing arguments to max; returning -Inf
+[1] "NOMETRO_NORMAL_STILL_1"
+[1] "d=5;e=2;r=0.4 -> RR=1.373;DET=35.028"
+[1] "d=5;e=2;r=0.5 -> RR=2.926;DET=50.466"
+[1] "d=5;e=3;r=0.65 -> RR=2.149;DET=51.828"
+[1] "d=5;e=3;r=0.8 -> RR=4.379;DET=64.437"
+[1] "d=5;e=4;r=0.8 -> RR=1.933;DET=55.887"
+[1] "d=10;e=2;r=0.4 -> RR=1.146;DET=30.935"
+[1] "d=10;e=2;r=0.5 -> RR=2.512;DET=46.336"
+[1] "d=10;e=3;r=0.65 -> RR=1.693;DET=46.675"
+[1] "d=10;e=3;r=0.8 -> RR=3.593;DET=61.078"
+[1] "d=10;e=4;r=0.8 -> RR=1.438;DET=49.444"
+[1] "d=25;e=2;r=0.5 -> RR=2.05;DET=45.418"
+[1] "d=25;e=2;r=0.65 -> RR=4.571;DET=62.062"
+[1] "d=25;e=3;r=0.65 -> RR=1.169;DET=45.615"
+[1] "d=25;e=3;r=0.8 -> RR=2.519;DET=60.468"
+Warning in max(t1) : no non-missing arguments to max; returning -Inf
+[1] "Matches all recordings for NOMETRO_NORMAL_STILL"
+List of 10
+ $ : chr "d=5;e=2;r=0.5"
+ $ : chr "d=5;e=3;r=0.65"
+ $ : chr "d=5;e=3;r=0.8"
+ $ : chr "d=5;e=4;r=0.8"
+ $ : chr "d=10;e=2;r=0.5"
+ $ : chr "d=10;e=3;r=0.65"
+ $ : chr "d=10;e=3;r=0.8"
+ $ : chr "d=25;e=2;r=0.5"
+ $ : chr "d=25;e=2;r=0.65"
+ $ : chr "d=25;e=3;r=0.8"
+NULL
+
+# Results
+## mdCRQA
+```{r}
+# R chunk
+
+# NOTE: these values can actually be different from style to style! Therefore, feel free to run the code on several different hyperparameters and compare outputs of different styles on different hyperparameters.
+# Change these based on the output of the previous code block. Ideally, the parameters 'fit' all recordings within a style
+library(crqa)
+
+DELAY <-      10
+EMBED_DIM <-  3
+RADIUS <-     0.8
+
+# Print %RR and %DET for all recordings using selected parameters
+print(sprintf("delay=%s; embed_dim=%s; radius=%s", DELAY, EMBED_DIM, RADIUS))
+print("")
+for (i in 1:length(normalized_data)) {
+  rec_data <- normalized_data[i]
+
+  result <- crqa(ts1=rec_data[[1]][[1]], ts2=rec_data[[1]][[2]], delay=DELAY, embed=EMBED_DIM, radius=RADIUS, method="mdcrqa", normalize=2)
+  print(sprintf("%s - RR=%s; DET=%s", array(py$labels)[i], round(result$RR,3), round(result$DET,3)))
+}
+```
+[1] "delay=10; embed_dim=3; radius=0.8"
+[1] ""
+[1] "NOMETRO_NORMAL_NORMAL_2 - RR=3.819; DET=80.327"
+[1] "NOMETRO_NORMAL_NORMAL_1 - RR=3.461; DET=73.519"
+[1] "NOMETRO_NORMAL_NORMAL_3 - RR=89.092; DET=99.999"
+[1] "NOMETRO_NORMAL_EXAG_3 - RR=4.569; DET=76.857"
+[1] "NOMETRO_NORMAL_EXAG_1 - RR=4.33; DET=78.197"
+[1] "NOMETRO_NORMAL_EXAG_2 - RR=2.632; DET=66.586"
+[1] "NOMETRO_NORMAL_STILL_3 - RR=2.975; DET=66.806"
+[1] "NOMETRO_NORMAL_STILL_2 - RR=2.21; DET=62.881"
+[1] "NOMETRO_NORMAL_STILL_1 - RR=3.593; DET=61.078"
+
+
+## Transfer Entropy
+
+### X coordinate
+```{r}
+library(RTransferEntropy)
+
+#create a dataframe
+all_res <- data.frame(i = numeric(), direction = character(), te = numeric(), ete = numeric(), se = numeric(), p=numeric(), lx =numeric())
+
+#for all time series of interest
+for (i in seq(normalized_data)) {
+  rec_data <- normalized_data[i]
+
+  #and for all history lengths up to LXS
+  for (lx in seq(py$LXS)) {
+    #compute transfer entropy
+    te <- transfer_entropy(rec_data[[1]][[1]]$x,rec_data[[1]][[2]]$x, nboot = 100, lx=lx ,ly=lx, seed = py$SEED, quiet = TRUE)
+    #add left->right and right->left TE values to the dataframe
+    xy <- c(i, 'x->y', te$coef[1], te$coef[3], te$coef[5], te$coef[7], lx)
+    yx <- c(i, 'y->x', te$coef[2], te$coef[4], te$coef[6], te$coef[8], lx)
+    all_res <- rbind(all_res, xy)
+    all_res <- rbind(all_res, yx)
+    print(sprintf("for %s and history of: %s directionality index x-y: %s",array(py$labels)[i], lx, te$coef[1] - te$coef[2]))
+  
+  }
+}
+#make all appropriate columns numeric
+colnames(all_res) = c('i','direction', 'te', 'ete', 'se', 'p', 'lx')
+all_res$te <- as.numeric(as.character(all_res$te))
+all_res$ete <- as.numeric(as.character(all_res$ete))
+all_res$se <- as.numeric(as.character(all_res$se))
+all_res$p <- as.numeric(as.character(all_res$p))
+all_res$lx <- as.numeric(as.character(all_res$lx))
+#Save only the significant values in a separate dataframe
+sig_res <- subset(all_res, p < 0.05)
+#display the significant results
+print(sig_res)
+
+#write significant results into a csv for easier interpretation
+#write.csv(sig_res, "C:/Users/hajko/Desktop/Complex systems/project (new)/sig_xdata.csv", row.names=FALSE)
+```
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 1 directionality index x-y: -0.00612502435196277"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 2 directionality index x-y: -0.00413808935624588"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 3 directionality index x-y: 0.000476685088071679"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 4 directionality index x-y: 0.00329003835323721"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 5 directionality index x-y: 0.00841517488563737"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 1 directionality index x-y: 0.0085754208621281"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 2 directionality index x-y: 0.00162043743019499"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 3 directionality index x-y: 0.00134783612452011"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 4 directionality index x-y: 0.00768558032977263"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 5 directionality index x-y: 0.00560298244183527"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 1 directionality index x-y: 0.00295512115844958"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 2 directionality index x-y: 0.00446870072343488"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 3 directionality index x-y: 0.0198568069554722"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 4 directionality index x-y: 0.00946298320363155"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 5 directionality index x-y: 0.0089871345766279"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 1 directionality index x-y: 0.00136791994744967"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 2 directionality index x-y: 0.0141891534585603"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 3 directionality index x-y: 0.020557710685927"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 4 directionality index x-y: 0.0256015413383466"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 5 directionality index x-y: 0.0253023965143232"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 1 directionality index x-y: 0.0115995595965608"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 2 directionality index x-y: 0.00847746302601586"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 3 directionality index x-y: 0.00944259258118482"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 4 directionality index x-y: 0.0151828424970183"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 5 directionality index x-y: 0.0234605059459319"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 1 directionality index x-y: 0.00694350587345545"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 2 directionality index x-y: 0.0109677131385426"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 3 directionality index x-y: 0.00690541145045934"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 4 directionality index x-y: 0.00240346381256114"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 5 directionality index x-y: 0.00789361040775152"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 1 directionality index x-y: 0.00751337643997649"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 2 directionality index x-y: 0.00245140100125357"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 3 directionality index x-y: 0.00118673733703131"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 4 directionality index x-y: 0.00777137544907669"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 5 directionality index x-y: 0.0135642372647959"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 1 directionality index x-y: 0.0089320036160402"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 2 directionality index x-y: 0.00504828056226321"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 3 directionality index x-y: 0.00565924666751155"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 4 directionality index x-y: 0.00619715660713965"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 5 directionality index x-y: 0.0114196663316373"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 1 directionality index x-y: -0.00903623391797406"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 2 directionality index x-y: -0.000131465506280543"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 3 directionality index x-y: -0.00265664469742841"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 4 directionality index x-y: 0.00152783757505574"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 5 directionality index x-y: 0.00199451976125693"
+   i direction          te         ete          se    p lx
+1  1      x->y 0.007750094 0.004213035 0.001503431 0.02  1
+2  1      y->x 0.013875118 0.010716098 0.001202380 0.00  1
+4  1      y->x 0.019895091 0.008036338 0.002982815 0.01  2
+5  1      x->y 0.032396807 0.001992074 0.004915697 0.03  3
+6  1      y->x 0.031920122 0.008203440 0.004063956 0.01  3
+7  1      x->y 0.046778323 0.000000000 0.006487027 0.00  4
+8  1      y->x 0.043488285 0.008773852 0.006828869 0.03  4
+9  1      x->y 0.054900386 0.000000000 0.007739212 0.01  5
+11 2      x->y 0.015404168 0.012236579 0.001199324 0.00  1
+12 2      y->x 0.006828747 0.003571633 0.001221512 0.00  1
+13 2      x->y 0.034465002 0.020021836 0.003090703 0.00  2
+14 2      y->x 0.032844564 0.020252859 0.002922203 0.00  2
+15 2      x->y 0.040868712 0.011461303 0.004752019 0.00  3
+16 2      y->x 0.039520876 0.015932327 0.004970651 0.00  3
+17 2      x->y 0.048296594 0.005236723 0.005217829 0.00  4
+19 2      x->y 0.047990807 0.000000000 0.006049645 0.02  5
+21 3      x->y 0.034985982 0.030783010 0.001299875 0.00  1
+22 3      y->x 0.032030861 0.027848919 0.001477125 0.00  1
+23 3      x->y 0.061051807 0.041983752 0.003627192 0.00  2
+24 3      y->x 0.056583106 0.041605427 0.003426260 0.00  2
+25 3      x->y 0.064841642 0.030645728 0.007045158 0.00  3
+26 3      y->x 0.044984835 0.020305061 0.007403816 0.02  3
+27 3      x->y 0.050326422 0.006316189 0.008829598 0.02  4
+31 4      x->y 0.009861648 0.006499996 0.001455762 0.00  1
+32 4      y->x 0.008493728 0.005533511 0.001158297 0.00  1
+33 4      x->y 0.030497254 0.014476628 0.002942429 0.00  2
+34 4      y->x 0.016308101 0.005214736 0.002758507 0.04  2
+35 4      x->y 0.039880192 0.008688742 0.003868173 0.00  3
+37 4      x->y 0.050301656 0.002235726 0.005716306 0.00  4
+39 4      x->y 0.053598289 0.000000000 0.007067093 0.00  5
+41 5      x->y 0.016744159 0.012661480 0.001424726 0.00  1
+43 5      x->y 0.035387071 0.020236671 0.003228580 0.00  2
+44 5      y->x 0.026909608 0.013881187 0.002911251 0.00  2
+45 5      x->y 0.041748568 0.013356860 0.004854240 0.00  3
+46 5      y->x 0.032305976 0.009567184 0.004780583 0.01  3
+47 5      x->y 0.049713783 0.009100493 0.005781564 0.00  4
+49 5      x->y 0.053559060 0.003851407 0.008008770 0.01  5
+51 6      x->y 0.011847897 0.008289432 0.001424261 0.00  1
+53 6      x->y 0.025871281 0.012235256 0.002504965 0.00  2
+55 6      x->y 0.034121862 0.008123672 0.004716956 0.01  3
+61 7      x->y 0.009302350 0.006591874 0.001155941 0.00  1
+63 7      x->y 0.015632846 0.003029973 0.002393366 0.03  2
+64 7      y->x 0.013181445 0.002862284 0.002044079 0.04  2
+67 7      x->y 0.035977703 0.000000000 0.005661917 0.03  4
+69 7      x->y 0.048128724 0.000000000 0.006299054 0.01  5
+71 8      x->y 0.013083326 0.010250658 0.001274601 0.00  1
+73 8      x->y 0.013431282 0.000000000 0.002133521 0.03  2
+77 8      x->y 0.028288395 0.000000000 0.004436143 0.04  4
+79 8      x->y 0.039495378 0.000000000 0.005637708 0.01  5
+82 9      y->x 0.011200717 0.008375172 0.001245479 0.00  1
+83 9      x->y 0.019332304 0.005067237 0.002456976 0.00  2
+84 9      y->x 0.019463770 0.008313701 0.002323204 0.00  2
+85 9      x->y 0.035187816 0.005089063 0.003927052 0.00  3
+86 9      y->x 0.037844460 0.016005482 0.003393991 0.00  3
+87 9      x->y 0.046100345 0.000000000 0.005459113 0.00  4
+88 9      y->x 0.044572507 0.012711874 0.005506807 0.00  4
+89 9      x->y 0.051698688 0.000000000 0.006939705 0.01  5
+90 9      y->x 0.049704169 0.008382984 0.007371147 0.02  5
+
+### Y coordinate
+```{r}
+# R chunk
+
+library(RTransferEntropy)
+
+all_res <- data.frame(i = numeric(), direction = character(), te = numeric(), ete = numeric(), se = numeric(), p=numeric(), lx =numeric())
+
+for (i in seq(normalized_data)) {
+  rec_data <- normalized_data[i]
+
+  for (lx in seq(py$LXS)) {
+    te <- transfer_entropy(rec_data[[1]][[1]]$y,rec_data[[1]][[2]]$y, nboot = 100, lx=lx ,ly=lx, seed = py$SEED, quiet = TRUE)
+    xy <- c(i, 'x->y', te$coef[1], te$coef[3], te$coef[5], te$coef[7], lx)
+    yx <- c(i, 'y->x', te$coef[2], te$coef[4], te$coef[6], te$coef[8], lx)
+    all_res <- rbind(all_res, xy)
+    all_res <- rbind(all_res, yx)
+    print(sprintf("for %s and history of: %s directionality index x-y: %s",array(py$labels)[i], lx, te$coef[1] - te$coef[2]))
+  
+  }
+}
+
+colnames(all_res) = c('i','direction', 'te', 'ete', 'se', 'p', 'lx')
+all_res$te <- as.numeric(as.character(all_res$te))
+all_res$ete <- as.numeric(as.character(all_res$ete))
+all_res$se <- as.numeric(as.character(all_res$se))
+all_res$p <- as.numeric(as.character(all_res$p))
+all_res$lx <- as.numeric(as.character(all_res$lx))
+sig_res <- subset(all_res, p < 0.05)
+print(sig_res)
+```
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 1 directionality index x-y: 0.0169267124796554"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 2 directionality index x-y: -0.000137060883286577"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 3 directionality index x-y: 0.00753684617869713"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 4 directionality index x-y: 0.014525306153154"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 5 directionality index x-y: 0.0121981170380618"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 1 directionality index x-y: 0.0157837444475326"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 2 directionality index x-y: 0.00577526416530401"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 3 directionality index x-y: 0.000109672888474792"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 4 directionality index x-y: -0.00233325030154849"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 5 directionality index x-y: 0.00137769448799967"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 1 directionality index x-y: 0.0133411278766137"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 2 directionality index x-y: -0.00125301930504844"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 3 directionality index x-y: 0.00951446563909793"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 4 directionality index x-y: 0.00742081278334018"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 5 directionality index x-y: 0.00463151536579742"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 1 directionality index x-y: 0.00392536398546893"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 2 directionality index x-y: 0.00973350758684784"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 3 directionality index x-y: 0.00492079113684663"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 4 directionality index x-y: 0.00284846162474246"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 5 directionality index x-y: 0.0116172046389492"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 1 directionality index x-y: -0.0139875904230382"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 2 directionality index x-y: -0.0094328765605883"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 3 directionality index x-y: -0.0105924284588894"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 4 directionality index x-y: -0.00823494368486404"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 5 directionality index x-y: -0.0101693633461393"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 1 directionality index x-y: 0.00731908920492885"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 2 directionality index x-y: 0.00217581942103769"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 3 directionality index x-y: 0.000881907883486126"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 4 directionality index x-y: 0.00245853404925182"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 5 directionality index x-y: 0.00236516155803815"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 1 directionality index x-y: 0.0119288200459588"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 2 directionality index x-y: 0.00952351361297846"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 3 directionality index x-y: 0.0109623013033658"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 4 directionality index x-y: 0.0126724311200288"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 5 directionality index x-y: 0.0113538591373099"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 1 directionality index x-y: 0.00160537076722527"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 2 directionality index x-y: 0.00874145549177281"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 3 directionality index x-y: 0.010138842532014"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 4 directionality index x-y: 0.0145031916025306"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 5 directionality index x-y: 0.0149859183939609"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 1 directionality index x-y: -0.000631652434263233"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 2 directionality index x-y: 0.0022769003433068"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 3 directionality index x-y: 0.00682031121647124"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 4 directionality index x-y: 0.0117089912635793"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 5 directionality index x-y: 0.0165749541949963"
+   i direction          te          ete           se    p lx
+1  1      x->y 0.028311213 0.0248335455 0.0013204792 0.00  1
+2  1      y->x 0.011384501 0.0078190831 0.0013835195 0.00  1
+3  1      x->y 0.031074517 0.0179639895 0.0026437380 0.00  2
+4  1      y->x 0.031211578 0.0169014112 0.0032781283 0.00  2
+5  1      x->y 0.036365285 0.0111872749 0.0046527984 0.00  3
+7  1      x->y 0.045031802 0.0067099165 0.0061325924 0.01  4
+11 2      x->y 0.022025294 0.0185280818 0.0013988546 0.00  1
+12 2      y->x 0.006241550 0.0025953275 0.0013588025 0.03  1
+13 2      x->y 0.034226759 0.0207197870 0.0037409895 0.00  2
+14 2      y->x 0.028451495 0.0123754699 0.0036588137 0.00  2
+15 2      x->y 0.042875433 0.0176877955 0.0044708353 0.00  3
+16 2      y->x 0.042765760 0.0077936562 0.0058835474 0.00  3
+18 2      y->x 0.046660877 0.0000000000 0.0069684282 0.03  4
+21 3      x->y 0.047845257 0.0436724719 0.0013966167 0.00  1
+22 3      y->x 0.034504129 0.0299631170 0.0012966238 0.00  1
+23 3      x->y 0.067448446 0.0504123746 0.0041565705 0.00  2
+24 3      y->x 0.068701465 0.0520581316 0.0041958263 0.00  2
+25 3      x->y 0.051813544 0.0216300260 0.0066288505 0.00  3
+26 3      y->x 0.042299078 0.0161926977 0.0069224775 0.03  3
+31 4      x->y 0.026966930 0.0229996300 0.0014040388 0.00  1
+32 4      y->x 0.023041566 0.0193427086 0.0014702930 0.00  1
+33 4      x->y 0.053106930 0.0332983688 0.0042899187 0.00  2
+34 4      y->x 0.043373422 0.0254193381 0.0036974142 0.00  2
+35 4      x->y 0.056066667 0.0181859816 0.0058426406 0.00  3
+36 4      y->x 0.051145876 0.0157635077 0.0058553479 0.00  3
+41 5      x->y 0.011151040 0.0069493990 0.0015832685 0.00  1
+42 5      y->x 0.025138631 0.0212374255 0.0013785638 0.00  1
+43 5      x->y 0.038417935 0.0206903791 0.0040586647 0.00  2
+44 5      y->x 0.047850811 0.0293242209 0.0043666472 0.00  2
+45 5      x->y 0.059115782 0.0233068078 0.0063815690 0.00  3
+46 5      y->x 0.069708210 0.0340831122 0.0058347624 0.00  3
+48 5      y->x 0.061473506 0.0122585731 0.0077946532 0.00  4
+51 6      x->y 0.014907202 0.0113793425 0.0014320392 0.00  1
+52 6      y->x 0.007588113 0.0038218042 0.0017924000 0.03  1
+53 6      x->y 0.030947823 0.0156720017 0.0032547054 0.00  2
+54 6      y->x 0.028772003 0.0122984360 0.0034339753 0.00  2
+55 6      x->y 0.040089985 0.0079820816 0.0051346418 0.01  3
+56 6      y->x 0.039208077 0.0050276213 0.0055538221 0.02  3
+57 6      x->y 0.048856234 0.0018099524 0.0065222212 0.02  4
+61 7      x->y 0.019683008 0.0170784301 0.0010522343 0.00  1
+62 7      y->x 0.007754188 0.0046967285 0.0010858351 0.00  1
+63 7      x->y 0.025730158 0.0140933172 0.0021576271 0.00  2
+64 7      y->x 0.016206644 0.0063995242 0.0024134172 0.00  2
+65 7      x->y 0.033845676 0.0110975295 0.0035198415 0.00  3
+66 7      y->x 0.022883375 0.0026658991 0.0031758222 0.02  3
+67 7      x->y 0.041816157 0.0060092599 0.0049832028 0.00  4
+69 7      x->y 0.043649396 0.0000000000 0.0066600991 0.04  5
+71 8      x->y 0.010337911 0.0075228007 0.0009678770 0.00  1
+72 8      y->x 0.008732541 0.0058744370 0.0009618073 0.00  1
+73 8      x->y 0.024085371 0.0127378511 0.0024984647 0.00  2
+74 8      y->x 0.015343915 0.0044785868 0.0025863752 0.04  2
+75 8      x->y 0.029732213 0.0079162908 0.0035497929 0.00  3
+76 8      y->x 0.019593370 0.0004851213 0.0029421311 0.03  3
+77 8      x->y 0.036657831 0.0035550299 0.0043494915 0.00  4
+79 8      x->y 0.041089872 0.0000000000 0.0055391029 0.01  5
+81 9      x->y 0.013302799 0.0101913230 0.0014244122 0.00  1
+82 9      y->x 0.013934451 0.0106541638 0.0012352767 0.00  1
+83 9      x->y 0.020950700 0.0084308853 0.0026429318 0.00  2
+84 9      y->x 0.018673800 0.0074836668 0.0026596667 0.01  2
+85 9      x->y 0.030515643 0.0070077336 0.0042666398 0.00  3
+86 9      y->x 0.023695332 0.0037563094 0.0034498425 0.02  3
+87 9      x->y 0.037885441 0.0013953429 0.0050879031 0.01  4
+89 9      x->y 0.046344513 0.0000000000 0.0063348491 0.03  5
+
+
+### Z coordinate
+```{r}
+# R chunk
+
+library(RTransferEntropy)
+
+all_res <- data.frame(i = numeric(), direction = character(), te = numeric(), ete = numeric(), se = numeric(), p=numeric(), lx =numeric())
+
+for (i in seq(normalized_data)) {
+  rec_data <- normalized_data[i]
+
+  for (lx in seq(py$LXS)) {
+    te <- transfer_entropy(rec_data[[1]][[1]]$z,rec_data[[1]][[2]]$z, nboot = 100, lx=lx ,ly=lx, seed = py$SEED, quiet = TRUE)
+    xy <- c(i, 'x->y', te$coef[1], te$coef[3], te$coef[5], te$coef[7], lx)
+    yx <- c(i, 'y->x', te$coef[2], te$coef[4], te$coef[6], te$coef[8], lx)
+    all_res <- rbind(all_res, xy)
+    all_res <- rbind(all_res, yx)
+    print(sprintf("for %s and history of: %s directionality index x-y: %s",array(py$labels)[i], lx, te$coef[1] - te$coef[2]))
+  
+  }
+}
+
+colnames(all_res) = c('i','direction', 'te', 'ete', 'se', 'p', 'lx')
+all_res$te <- as.numeric(as.character(all_res$te))
+all_res$ete <- as.numeric(as.character(all_res$ete))
+all_res$se <- as.numeric(as.character(all_res$se))
+all_res$p <- as.numeric(as.character(all_res$p))
+all_res$lx <- as.numeric(as.character(all_res$lx))
+sig_res <- subset(all_res, p < 0.05)
+print(sig_res)
+```
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 1 directionality index x-y: 0.00682563194268446"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 2 directionality index x-y: 0.0057794883116728"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 3 directionality index x-y: 0.00299309068300098"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 4 directionality index x-y: 0.00453249897559799"
+[1] "for NOMETRO_NORMAL_NORMAL_2 and history of: 5 directionality index x-y: 0.00183197143251411"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 1 directionality index x-y: -0.000388942092794851"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 2 directionality index x-y: 0.0101604532776306"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 3 directionality index x-y: 0.00948493271517642"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 4 directionality index x-y: 0.0124776021576484"
+[1] "for NOMETRO_NORMAL_NORMAL_1 and history of: 5 directionality index x-y: 0.0180673407020213"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 1 directionality index x-y: 0.00238150523530792"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 2 directionality index x-y: 0.0116464829288024"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 3 directionality index x-y: 0.00442872140072128"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 4 directionality index x-y: 0.00183070317045932"
+[1] "for NOMETRO_NORMAL_NORMAL_3 and history of: 5 directionality index x-y: 0.0063574589494951"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 1 directionality index x-y: -0.000575943317992263"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 2 directionality index x-y: 0.000901333749020926"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 3 directionality index x-y: -0.00139915418222463"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 4 directionality index x-y: 0.00175167811885667"
+[1] "for NOMETRO_NORMAL_EXAG_3 and history of: 5 directionality index x-y: -0.00147802786784441"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 1 directionality index x-y: 0.00291302213058123"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 2 directionality index x-y: 0.000782134312011035"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 3 directionality index x-y: -0.000952328116068454"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 4 directionality index x-y: 0.00107252347002516"
+[1] "for NOMETRO_NORMAL_EXAG_1 and history of: 5 directionality index x-y: 0.00177286722480842"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 1 directionality index x-y: 0.00516056607496697"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 2 directionality index x-y: 0.00402893092732281"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 3 directionality index x-y: -0.00395420868716098"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 4 directionality index x-y: 0.000865748606527857"
+[1] "for NOMETRO_NORMAL_EXAG_2 and history of: 5 directionality index x-y: 0.00114020205115564"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 1 directionality index x-y: -0.00564834989773579"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 2 directionality index x-y: -0.0037907904073555"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 3 directionality index x-y: -0.00167221344686461"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 4 directionality index x-y: 0.00313836876876143"
+[1] "for NOMETRO_NORMAL_STILL_3 and history of: 5 directionality index x-y: -0.00127836532140352"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 1 directionality index x-y: 0.00201077590252865"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 2 directionality index x-y: 0.00148732559896522"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 3 directionality index x-y: 0.000983178574652691"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 4 directionality index x-y: 0.00637132757645897"
+[1] "for NOMETRO_NORMAL_STILL_2 and history of: 5 directionality index x-y: 0.00891781406024687"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 1 directionality index x-y: -0.000359958411367451"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 2 directionality index x-y: -0.00161191999662256"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 3 directionality index x-y: -0.00855150276747844"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 4 directionality index x-y: -0.0070182816618817"
+[1] "for NOMETRO_NORMAL_STILL_1 and history of: 5 directionality index x-y: -0.00426659559852002"
+   i direction          te         ete          se    p lx
+1  1      x->y 0.011784301 0.008391519 0.001349718 0.00  1
+3  1      x->y 0.020717462 0.007058343 0.002668283 0.00  2
+11 2      x->y 0.011267330 0.007730137 0.001413193 0.00  1
+12 2      y->x 0.011656272 0.008027173 0.001510757 0.00  1
+13 2      x->y 0.031869364 0.018964533 0.003173783 0.00  2
+14 2      y->x 0.021708911 0.008382324 0.003423247 0.03  2
+15 2      x->y 0.030832412 0.004587261 0.004435812 0.03  3
+21 3      x->y 0.034707448 0.030237665 0.001444256 0.00  1
+22 3      y->x 0.032325942 0.027891188 0.001733129 0.00  1
+23 3      x->y 0.063456168 0.046732607 0.004528685 0.00  2
+24 3      y->x 0.051809685 0.035425460 0.003877914 0.00  2
+25 3      x->y 0.056530656 0.028083940 0.006911950 0.00  3
+26 3      y->x 0.052101934 0.021904897 0.006811344 0.00  3
+31 4      x->y 0.008611074 0.005800626 0.001139109 0.00  1
+32 4      y->x 0.009187018 0.006398135 0.001098306 0.00  1
+41 5      x->y 0.005711649 0.002920753 0.001118245 0.01  1
+43 5      x->y 0.012315189 0.002678155 0.002304053 0.02  2
+44 5      y->x 0.011533054 0.001924067 0.002120291 0.01  2
+51 6      x->y 0.008381095 0.004987775 0.001468675 0.00  1
+62 7      y->x 0.009569664 0.007126413 0.001319996 0.00  1
+64 7      y->x 0.018378719 0.005971971 0.002431869 0.02  2
+71 8      x->y 0.009309987 0.006739873 0.001191631 0.00  1
+72 8      y->x 0.007299211 0.004448757 0.001307996 0.00  1
+73 8      x->y 0.018434146 0.007735453 0.002006333 0.00  2
+75 8      x->y 0.031882370 0.009156430 0.003906493 0.00  3
+76 8      y->x 0.030899191 0.006532353 0.004482117 0.02  3
+77 8      x->y 0.046784246 0.010352676 0.006127759 0.00  4
+86 9      y->x 0.035332679 0.005234780 0.005342065 0.01  3
+87 9      x->y 0.044352999 0.004063642 0.005914751 0.04  4
+88 9      y->x 0.051371280 0.003188101 0.006653709 0.01  4
+
+
+# Surrogate Testing
+``` {python}
+# Python chunk
+
+np.random.seed(SEED)
+
+def generate_surrogates(ts, window_size, n_surrogates=100):
+  """
+  this code is adapted from the shuffle_time_windows function in Hudson, D., Wiltshire, T. J., &  Atzmueller, M. (2023). multiSyncPy: A Python package for assessing multivariate coordination dynamics. Behavior Research Methods, 55(2), 932-962. https://doi.org/10.3758/s13428-022-01855-y.
+  
+  parameters:
+  ts: time series should be of shape (nrows, 3)
+  window size: how to choose the size?
+  
+  returns: an array of generated surrogate data (by default 100 surrogate time series)
+  """
+  surrogates_list = []
+  surrogate_shape = ts.shape
+  ts = np.array(ts).copy()
+  
+  ## this trimming part can be commented out if needed
+  # trim the data so that the data length is divisible by window_size
+  n_windows = surrogate_shape[0] // window_size
+  trimmed_size = n_windows * window_size
+  ts = ts[:trimmed_size]
+  ##
+  
+  for n in range(n_surrogates):
+    # split the time series into windows
+    surrogate_data = ts.reshape(-1, window_size, 3).copy() # so that the individual windows can be shuffled, not each individual row
+    # shuffle the windows
+    np.random.shuffle(surrogate_data)
+    surrogate_data = surrogate_data.reshape(-1, 3)
+    # add to the list of generated data
+    surrogates_list.append(surrogate_data)
+    
+  return np.array(surrogates_list)
+
+```
+
+``` {python}
+# Python chunk
+
+all_surrogate_data = []
+normalized_data = r.normalized_data
+
+# save all surrogate data in one place, for left and right hand with playing intention label
+for i in range(len(normalized_data)):
+    intention = labels[i][15]  # the intention character (N or E)
+    lhand = np.array(normalized_data[i][0])
+    rhand = np.array(normalized_data[i][1])
+    
+    # generate and append surrogates for each hand
+    all_surrogate_data.append({
+        "intention": intention,
+        "surrogatesL": generate_surrogates(lhand, window_size=200),  # shape: (100, trimmed_size, 3)
+        "surrogatesR": generate_surrogates(rhand, window_size=200)   
+    })
+```
+
+``` {r}
+# R chunk
+
+# create a data frame with all %RR and %DET values for surrogates, and corresponding intention labels
+df <- data.frame(intention = character(), surr_RR = numeric(), surr_DET = numeric())
+
+surr_num <- 100  # change this if necessary (should match n_surrogates)
+
+# go over all surrogates in all_surrogate_data
+for (i in 1:length(py$all_surrogate_data)) {
+    surrogate_data <- py$all_surrogate_data[[i]]
+    intention <- surrogate_data$intention
+    surr_L <- surrogate_data$surrogatesL  # (100, trimmed_size, 3)
+    surr_R <- surrogate_data$surrogatesR
+  
+    # access each one of the 100 generated surrogate series (for each hand) and perform mdCRQA  
+    for (surr in 1:surr_num) {
+        tsL_surr <- as.data.frame(surr_L[surr,,])
+        tsR_surr <- as.data.frame(surr_R[surr,,])
+        colnames(tsL_surr) <- c("x", "y", "z")
+        colnames(tsR_surr) <- c("x", "y", "z")
+        
+        # mdCRQA with the current left and right hand surrogate series
+        result <- crqa(ts1=tsL_surr, ts2=tsR_surr, delay=DELAY, embed=EMBED_DIM,
+                       radius=RADIUS, method="mdcrqa", normalize=2)
+        # save the %RR and %DET with the corresponding intention info
+        df <- rbind(df, data.frame(intention=intention, surr_RR=result$RR,
+                                   surr_DET=result$DET))
+    }
+}
+
+# split into two datasets: normal and exaggerated playing
+norm <- subset(df, intention == "N")
+exag <- subset(df, intention == "E")
+stil <- subset(df, intention == "S")
+```
+
+``` {r}
+# R chunk
+
+library(gmodels)
+# Calculate mean
+mean_RR <- mean(norm$surr_RR)
+mean_RR
+mean_DET <- mean(norm$surr_DET)
+mean_DET
+  
+# Calculate length
+n_RR <- length(norm$surr_RR)
+n_DET <- length(norm$surr_DET)
+
+# Calculate standard deviation
+sd_RR <- sd(norm$surr_RR)
+sd_DET <- sd(norm$surr_DET)
+
+# Calculate Standard Error
+error_RR <- qt(.95 + (1 - .95)/2, df = n_RR - 1) * sd_RR/sqrt(n_RR)
+error_DET <- qt(.95 + (1 - .95)/2, df = n_DET - 1) * sd_DET/sqrt(n_DET)
+
+# CI
+CI_RR <- c(lower = mean_RR - error_RR, mean = mean_RR, upper = mean_RR + error_RR)
+print(CI_RR)
+CI_DET <- c(lower = mean_DET - error_DET, mean = mean_DET, upper = mean_DET + error_DET)
+print(CI_DET)
+```
+[1] 30.28569
+[1] 77.44411
+   lower     mean    upper 
+25.71647 30.28569 34.85491 
+   lower     mean    upper 
+75.60292 77.44411 79.28529 
+
+(From mdCRQA)
+[1] "delay=10; embed_dim=3; radius=0.8"
+[1] ""
+[1] "NOMETRO_NORMAL_NORMAL_2 - RR=3.819; DET=80.327"
+[1] "NOMETRO_NORMAL_NORMAL_1 - RR=3.461; DET=73.519"
+[1] "NOMETRO_NORMAL_NORMAL_3 - RR=89.092; DET=99.999"
+
+
+
+```{r}
+# R chunk
+
+library(gmodels)
+# Calculate mean
+mean_RR <- mean(exag$surr_RR)
+mean_RR
+mean_DET <- mean(exag$surr_DET)
+mean_DET
+  
+# Calculate length
+n_RR <- length(exag$surr_RR)
+n_DET <- length(exag$surr_DET)
+
+# Calculate standard deviation
+sd_RR <- sd(exag$surr_RR)
+sd_DET <- sd(exag$surr_DET)
+
+# Calculate Standard Error
+error_RR <- qt(.95 + (1 - .95)/2, df = n_RR - 1) * sd_RR/sqrt(n_RR)
+error_DET <- qt(.95 + (1 - .95)/2, df = n_DET - 1) * sd_DET/sqrt(n_DET)
+
+# CI
+CI_RR <- c(lower = mean_RR - error_RR, mean = mean_RR, upper = mean_RR + error_RR)
+print(CI_RR)
+CI_DET <- c(lower = mean_DET - error_DET, mean = mean_DET, upper = mean_DET + error_DET)
+print(CI_DET)
+
+```
+[1] 3.127457
+[1] 69.74703
+   lower     mean    upper 
+3.022799 3.127457 3.232115 
+   lower     mean    upper 
+68.84601 69.74703 70.64804
+
+(From mdCRQA)
+[1] "delay=10; embed_dim=3; radius=0.8"
+[1] ""
+[1] "NOMETRO_NORMAL_EXAG_3 - RR=4.569; DET=76.857"
+[1] "NOMETRO_NORMAL_EXAG_1 - RR=4.33; DET=78.197"
+[1] "NOMETRO_NORMAL_EXAG_2 - RR=2.632; DET=66.586"
+
+
+```{r}
+# R chunk
+
+library(gmodels)
+# Calculate mean
+mean_RR <- mean(stil$surr_RR)
+mean_RR
+mean_DET <- mean(stil$surr_DET)
+mean_DET
+  
+# Calculate length
+n_RR <- length(stil$surr_RR)
+n_DET <- length(stil$surr_DET)
+
+# Calculate standard deviation
+sd_RR <- sd(stil$surr_RR)
+sd_DET <- sd(stil$surr_DET)
+
+# Calculate Standard Error
+error_RR <- qt(.95 + (1 - .95)/2, df = n_RR - 1) * sd_RR/sqrt(n_RR)
+error_DET <- qt(.95 + (1 - .95)/2, df = n_DET - 1) * sd_DET/sqrt(n_DET)
+
+# CI
+CI_RR <- c(lower = mean_RR - error_RR, mean = mean_RR, upper = mean_RR + error_RR)
+print(CI_RR)
+CI_DET <- c(lower = mean_DET - error_DET, mean = mean_DET, upper = mean_DET + error_DET)
+print(CI_DET)
+
+```
+[1] 2.228464
+[1] 61.02928
+   lower     mean    upper 
+2.201228 2.228464 2.255700 
+   lower     mean    upper 
+60.86182 61.02928 61.19675 
+
+(From mdCRQA)
+[1] "delay=10; embed_dim=3; radius=0.8"
+[1] ""
+[1] "NOMETRO_NORMAL_STILL_3 - RR=2.975; DET=66.806"
+[1] "NOMETRO_NORMAL_STILL_2 - RR=2.21; DET=62.881"
+[1] "NOMETRO_NORMAL_STILL_1 - RR=3.593; DET=61.078"
+
