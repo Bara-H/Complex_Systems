@@ -1,6 +1,8 @@
 # Spatiotemporal Hand Coordination in Expressive Piano Performance: Leader-Follower Dynamics and the Influence of Expressive Intentions
 
-The following code and results pertain to an analysis of coordination between hands during piano play when considering them as a complex system. Several expressive intentions while playing have been compared to get a perspective on how coordination changes.
+### Description
+
+The following code was written as a part of the Complex Systems course at Tilburg University. The goal of the project is to analyse the complex coupling relationships between hands during piano play in different playing styles (namely 'normal', 'exaggerated' and 'still'). The 'expressive musical gestures' dataset reported in a paper by Sarasúa et al. was used to this end. The R code uses mdCRQA and transfer entropy to analyse the changing relationships between these playing styles. Grid search is used to optimize the parameters and surrogate testing is used to verify results are not due to chance.
 
 ### Dataset
 
